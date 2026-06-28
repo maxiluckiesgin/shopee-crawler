@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Playwright and crawler output
+output/
+playwright-report/
+test-results/
+*.webm
+*.trace.zip
+
+# Saved authenticated browser/session data
+*-state.json
+*-cookies.json
+storage-state.json
+cookies.json
+
+# Generated screenshots and local artifacts
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
