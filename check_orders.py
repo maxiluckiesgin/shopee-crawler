@@ -841,7 +841,7 @@ async def check_orders(
 ) -> tuple[str, str, list[dict], list[dict], str, str, Path, Path, Path, Path, Path, Path, Path, int]:
     state_path = Path(args.state).expanduser().resolve()
     if not state_path.exists():
-        raise RuntimeError(f"Storage state not found at {state_path}. Login first with login_shopee.py --qr.")
+        raise RuntimeError(f"Storage state not found at {state_path}. Login first with login_shopee.py.")
 
     output_path = Path(args.output).expanduser().resolve()
     api_dump_path = Path(args.api_dump).expanduser().resolve()

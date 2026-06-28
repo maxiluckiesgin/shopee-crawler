@@ -5,16 +5,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import sys
 import time
 from getpass import getpass
 from pathlib import Path
-from urllib.parse import quote, urljoin
 
-from playwright.async_api import Browser, Error, Locator, Page, TimeoutError, async_playwright
+from playwright.async_api import Browser, Error, Page, TimeoutError, async_playwright
 
 
 LOGIN_URL = "https://shopee.co.id/buyer/login"
@@ -25,8 +23,6 @@ LOGOUT_URLS = [
 ]
 DEFAULT_STATE_PATH = "output/shopee-state.json"
 DEFAULT_COOKIES_PATH = "output/shopee-cookies.json"
-DEFAULT_QR_PATH = "output/shopee-qr.png"
-DEFAULT_CLI_QR_WIDTH = 64
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -59,28 +55,10 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("SHOPEE_OTP"),
         help="One-time code if Shopee asks for it. Defaults to SHOPEE_OTP.",
     )
-    parser.add_argument("--qr", action="store_true", help="Use Shopee QR login.")
-    parser.add_argument(
-        "--print-qr-url",
-        action="store_true",
-        help="Print the QR image URL/data URL so it can be copied from a VM.",
-    )
     parser.add_argument(
         "--print-login-url",
         action="store_true",
         help="Print the current Shopee login page URL after it opens.",
-    )
-    parser.add_argument(
-        "--qr-path",
-        default=os.getenv("SHOPEE_QR_PATH", DEFAULT_QR_PATH),
-        help=f"Where to save the QR screenshot. Defaults to {DEFAULT_QR_PATH}.",
-    )
-    parser.add_argument("--no-cli-qr", action="store_true", help="Do not print the QR in the terminal.")
-    parser.add_argument(
-        "--cli-qr-width",
-        type=int,
-        default=int(os.getenv("SHOPEE_CLI_QR_WIDTH", str(DEFAULT_CLI_QR_WIDTH))),
-        help=f"Terminal QR width in character cells. Defaults to {DEFAULT_CLI_QR_WIDTH}.",
     )
     parser.add_argument(
         "--state",
@@ -131,49 +109,6 @@ def chromium_args(args: argparse.Namespace) -> list[str]:
     if not args.allow_http2:
         launch_args.append("--disable-http2")
     return launch_args
-
-
-def print_qr_to_terminal(path: Path, max_width: int = DEFAULT_CLI_QR_WIDTH) -> None:
-    try:
-        from PIL import Image, ImageOps
-    except ImportError as exc:
-        raise RuntimeError(
-            "Printing QR to the CLI requires Pillow. Run: python -m pip install -r requirements.txt"
-        ) from exc
-
-    image = Image.open(path).convert("L")
-    mask = image.point(lambda pixel: 0 if pixel > 245 else 255, mode="1")
-    box = mask.getbbox()
-    if box:
-        image = image.crop(box)
-    if image.width > max_width:
-        height = max(1, round(image.height * max_width / image.width))
-        image = image.resize((max_width, height), Image.Resampling.NEAREST)
-
-    image = ImageOps.expand(image, border=4, fill=255)
-    pixels = image.point(lambda pixel: 0 if pixel < 160 else 255, mode="1")
-    print()
-    print("Scan this QR with the Shopee mobile app:")
-    for y in range(0, pixels.height, 2):
-        row = []
-        for x in range(pixels.width):
-            top_dark = pixels.getpixel((x, y)) == 0
-            bottom_dark = y + 1 < pixels.height and pixels.getpixel((x, y + 1)) == 0
-            if top_dark and bottom_dark:
-                row.append("█")
-            elif top_dark:
-                row.append("▀")
-            elif bottom_dark:
-                row.append("▄")
-            else:
-                row.append(" ")
-        print("".join(row))
-    print()
-
-
-def image_path_to_data_url(path: Path) -> str:
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
 
 
 async def first_visible(page: Page, selectors: list[str], timeout: int = 3000):
@@ -271,7 +206,22 @@ async def fill_identifier(page: Page, identifier: str) -> None:
     await identifier_input.fill(identifier)
 
 
-async def fill_password_if_present(page: Page, password: str | None) -> None:
+async def submit_login_form(page: Page) -> bool:
+    return await click_first(
+        page,
+        [
+            "button:has-text('Log in')",
+            "button:has-text('Login')",
+            "button:has-text('Masuk')",
+            "button:has-text('Lanjut')",
+            "button:has-text('Berikutnya')",
+            "button:has-text('Next')",
+            "button[type='submit']",
+        ],
+    )
+
+
+async def fill_password_if_present(page: Page, password: str | None) -> bool:
     password_input = await first_visible(
         page,
         [
@@ -283,19 +233,28 @@ async def fill_password_if_present(page: Page, password: str | None) -> None:
         timeout=8000,
     )
     if password_input is None:
-        return
+        return False
     if not password:
         password = getpass("Shopee password: ")
     await password_input.fill(password)
-    await click_first(
-        page,
-        [
-            "button:has-text('Log in')",
-            "button:has-text('Login')",
-            "button:has-text('Masuk')",
-            "button[type='submit']",
-        ],
-    )
+    await submit_login_form(page)
+    return True
+
+
+async def login_with_credentials(page: Page, args: argparse.Namespace) -> None:
+    await dismiss_language_modal(page)
+    if args.print_login_url or args.headful:
+        print("Login page URL:")
+        print(page.url)
+
+    await fill_identifier(page, args.identifier)
+    if not await fill_password_if_present(page, args.password):
+        if not await submit_login_form(page):
+            raise RuntimeError("Could not submit Shopee login identifier.")
+        if not await fill_password_if_present(page, args.password):
+            raise RuntimeError("Could not find Shopee password input after submitting identifier.")
+    await fill_otp_if_present(page, args.otp)
+    await wait_until_logged_in(page, args.login_timeout)
 
 
 async def fill_otp_if_present(page: Page, otp: str | None) -> None:
@@ -354,129 +313,6 @@ async def wait_until_logged_in(page: Page, timeout_ms: int) -> None:
     raise RuntimeError("Login did not finish before the timeout.")
 
 
-async def open_qr_login(page: Page) -> None:
-    try:
-        await page.goto("https://shopee.co.id/buyer/login/qr", wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
-        if await find_qr_locator(page) is not None:
-            return
-    except Error:
-        pass
-
-    for x, y in [(1155, 155), (1165, 150), (1145, 165)]:
-        await page.mouse.click(x, y)
-        await page.wait_for_timeout(1200)
-        if await find_qr_locator(page) is not None:
-            return
-
-    for selector in [
-        "text=/log\\s*in\\s*dengan\\s*qr/i",
-        "text=/login\\s*dengan\\s*qr/i",
-        "text=/kode\\s*qr/i",
-        "text=/qr\\s*code/i",
-        "text=/scan.*qr/i",
-    ]:
-        locator = page.locator(selector).first
-        try:
-            await locator.wait_for(state="visible", timeout=3000)
-            box = await locator.bounding_box()
-            if box:
-                await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                await page.wait_for_timeout(1500)
-                if await find_qr_locator(page) is not None:
-                    return
-        except (TimeoutError, Error):
-            continue
-
-    raise RuntimeError("Could not switch Shopee login page to QR mode.")
-
-
-async def find_qr_locator(page: Page) -> Locator | None:
-    for selector in [
-        "img[alt*='qr' i]",
-        "img[src*='qr' i]",
-        "canvas",
-        "svg",
-        "[data-testid*='qr' i]",
-        "[class*='qr' i]",
-    ]:
-        locator = page.locator(selector).first
-        try:
-            await locator.wait_for(state="visible", timeout=3000)
-            box = await locator.bounding_box()
-            if (
-                box
-                and box["width"] >= 100
-                and box["height"] >= 100
-                and box["x"] >= 760
-                and box["y"] <= 650
-            ):
-                return locator
-        except (TimeoutError, Error):
-            continue
-    return None
-
-
-async def extract_qr_url(page: Page, qr: Locator | None) -> str | None:
-    if qr is None:
-        return None
-    try:
-        tag_name = await qr.evaluate("element => element.tagName.toLowerCase()")
-        if tag_name == "img":
-            src = await qr.get_attribute("src")
-            if src:
-                return urljoin(page.url, src)
-        if tag_name == "canvas":
-            return await qr.evaluate("element => element.toDataURL('image/png')")
-        if tag_name == "svg":
-            svg = await qr.evaluate("element => element.outerHTML")
-            return "data:image/svg+xml;charset=utf-8," + quote(svg)
-    except Error:
-        return None
-    return None
-
-
-async def save_qr_screenshot(page: Page, qr_path: str) -> tuple[Path, Locator | None]:
-    path = Path(qr_path).expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    qr = await find_qr_locator(page)
-    if qr is None:
-        await page.screenshot(path=str(path), full_page=True)
-        raise RuntimeError(f"Could not find Shopee login QR. Saved page screenshot to {path}")
-    await qr.screenshot(path=str(path))
-    return path, qr
-
-
-async def login_with_qr(
-    page: Page,
-    qr_path: str,
-    login_timeout_ms: int,
-    print_cli_qr: bool,
-    print_qr_url: bool,
-    print_login_url: bool,
-    cli_qr_width: int,
-) -> Path:
-    await dismiss_language_modal(page)
-    await open_qr_login(page)
-    await dismiss_language_modal(page)
-    saved_qr_path, qr = await save_qr_screenshot(page, qr_path)
-    print(f"QR screenshot saved to {saved_qr_path}")
-    if print_login_url:
-        print("Login page URL:")
-        print(page.url)
-    if print_qr_url:
-        qr_url = await extract_qr_url(page, qr)
-        if not qr_url or qr_url.startswith("blob:"):
-            qr_url = image_path_to_data_url(saved_qr_path)
-        print("QR URL/data URL:")
-        print(qr_url)
-    if print_cli_qr:
-        print_qr_to_terminal(saved_qr_path, max_width=cli_qr_width)
-    print("Scan it with the Shopee mobile app, then approve the login request.")
-    await wait_until_logged_in(page, login_timeout_ms)
-    return saved_qr_path
-
-
 async def save_cookies(context, cookies_path: str) -> Path:
     path = Path(cookies_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,9 +367,9 @@ async def logout(args: argparse.Namespace) -> tuple[bool, list[Path]]:
 
 
 async def login(args: argparse.Namespace) -> tuple[Path, Path]:
-    if not args.qr and not args.identifier:
+    if not args.identifier:
         raise RuntimeError(
-            "Missing login identifier. Pass --identifier, set SHOPEE_IDENTIFIER, or use --qr."
+            "Missing login identifier. Pass --identifier or set SHOPEE_IDENTIFIER."
         )
 
     state_path = Path(args.state).expanduser().resolve()
@@ -557,24 +393,7 @@ async def login(args: argparse.Namespace) -> tuple[Path, Path]:
             context.set_default_timeout(args.timeout)
             page = await context.new_page()
             await goto_login(page)
-            if args.qr:
-                await login_with_qr(
-                    page,
-                    args.qr_path,
-                    args.login_timeout,
-                    print_cli_qr=not args.no_cli_qr,
-                    print_qr_url=args.print_qr_url,
-                    print_login_url=args.print_login_url or args.headful,
-                    cli_qr_width=args.cli_qr_width,
-                )
-            else:
-                if args.print_login_url or args.headful:
-                    print("Login page URL:")
-                    print(page.url)
-                await fill_identifier(page, args.identifier)
-                await fill_password_if_present(page, args.password)
-                await fill_otp_if_present(page, args.otp)
-                await wait_until_logged_in(page, args.login_timeout)
+            await login_with_credentials(page, args)
 
             await context.storage_state(path=str(state_path))
             cookies_path = await save_cookies(context, args.cookies)
@@ -587,9 +406,6 @@ def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
-    if args.cli_qr_width < 48:
-        print("--cli-qr-width must be at least 48 for a scannable QR.", file=sys.stderr)
-        return 2
     if args.logout:
         try:
             remote_attempted, removed_paths = asyncio.run(logout(args))
