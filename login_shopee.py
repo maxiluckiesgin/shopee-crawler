@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Log in to Shopee with Chromium and persist the browser session."""
+"""Create a Shopee Playwright session from credentials or exported cookies."""
 
 from __future__ import annotations
 
@@ -54,6 +54,14 @@ def parse_args() -> argparse.Namespace:
         "--otp",
         default=os.getenv("SHOPEE_OTP"),
         help="One-time code if Shopee asks for it. Defaults to SHOPEE_OTP.",
+    )
+    parser.add_argument(
+        "--cookies-txt",
+        default=os.getenv("SHOPEE_COOKIES_TXT"),
+        help=(
+            "Import a Netscape cookies.txt export instead of logging in with Chromium. "
+            f"Defaults to SHOPEE_COOKIES_TXT when set."
+        ),
     )
     parser.add_argument(
         "--print-login-url",
@@ -321,6 +329,95 @@ async def save_cookies(context, cookies_path: str) -> Path:
     return path
 
 
+def parse_netscape_cookies_txt(cookies_txt_path: str) -> list[dict]:
+    path = Path(cookies_txt_path).expanduser().resolve()
+    if not path.exists():
+        raise RuntimeError(f"cookies.txt not found at {path}")
+
+    cookies: list[dict] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("# Netscape") or line.startswith("# This file"):
+            continue
+
+        http_only = False
+        if line.startswith("#HttpOnly_"):
+            http_only = True
+            line = line.removeprefix("#HttpOnly_")
+        elif line.startswith("#"):
+            continue
+
+        parts = line.split("\t")
+        if len(parts) != 7:
+            parts = line.split(None, 6)
+        if len(parts) != 7:
+            raise RuntimeError(f"Invalid cookies.txt line {line_number}: expected 7 fields.")
+
+        domain, _include_subdomains, cookie_path, secure, expires, name, value = parts
+        if not name:
+            continue
+
+        try:
+            expires_value = int(expires)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid cookie expiry on line {line_number}: {expires}") from exc
+
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": cookie_path or "/",
+            "expires": expires_value if expires_value > 0 else -1,
+            "httpOnly": http_only,
+            "secure": secure.upper() == "TRUE",
+            "sameSite": "Lax",
+        }
+        cookies.append(cookie)
+
+    shopee_cookies = [
+        cookie
+        for cookie in cookies
+        if cookie["domain"].lstrip(".").endswith("shopee.co.id")
+    ]
+    if not shopee_cookies:
+        raise RuntimeError(f"No shopee.co.id cookies found in {path}")
+    return shopee_cookies
+
+
+def validate_imported_login_cookies(cookies: list[dict]) -> None:
+    by_name = {cookie["name"]: cookie.get("value", "") for cookie in cookies}
+    missing_or_guest = [
+        name
+        for name in ["SPC_U", "SPC_EC"]
+        if by_name.get(name) in (None, "", "-")
+    ]
+    if missing_or_guest:
+        raise RuntimeError(
+            "cookies.txt does not contain an authenticated Shopee session. "
+            f"Missing or guest auth cookie(s): {', '.join(missing_or_guest)}. "
+            "Open Shopee in your normal browser, confirm the account is logged in, "
+            "then export cookies for shopee.co.id again."
+        )
+
+
+def import_cookies_txt(args: argparse.Namespace) -> tuple[Path, Path, int]:
+    cookies = parse_netscape_cookies_txt(args.cookies_txt)
+    validate_imported_login_cookies(cookies)
+
+    state_path = Path(args.state).expanduser().resolve()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"cookies": cookies, "origins": []}, indent=2),
+        encoding="utf-8",
+    )
+
+    cookies_path = Path(args.cookies).expanduser().resolve()
+    cookies_path.parent.mkdir(parents=True, exist_ok=True)
+    cookies_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+
+    return state_path, cookies_path, len(cookies)
+
+
 async def logout(args: argparse.Namespace) -> tuple[bool, list[Path]]:
     state_path = Path(args.state).expanduser().resolve()
     cookies_path = Path(args.cookies).expanduser().resolve()
@@ -369,7 +466,8 @@ async def logout(args: argparse.Namespace) -> tuple[bool, list[Path]]:
 async def login(args: argparse.Namespace) -> tuple[Path, Path]:
     if not args.identifier:
         raise RuntimeError(
-            "Missing login identifier. Pass --identifier or set SHOPEE_IDENTIFIER."
+            "Missing login identifier. Pass --identifier, set SHOPEE_IDENTIFIER, "
+            "or import exported browser cookies with --cookies-txt."
         )
 
     state_path = Path(args.state).expanduser().resolve()
@@ -427,6 +525,18 @@ def main() -> int:
                 print(f"Removed {path}")
         else:
             print("No local Shopee state/cookie files to remove.")
+        return 0
+
+    if args.cookies_txt:
+        try:
+            state_path, cookies_path, cookie_count = import_cookies_txt(args)
+        except Exception as exc:
+            print(f"Cookie import failed: {exc}", file=sys.stderr)
+            return 1
+
+        print(f"Imported {cookie_count} Shopee cookies from {Path(args.cookies_txt).expanduser().resolve()}")
+        print(f"Shopee session saved to {state_path}")
+        print(f"Shopee cookies saved to {cookies_path}")
         return 0
 
     try:

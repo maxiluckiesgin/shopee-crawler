@@ -33,6 +33,7 @@ test-results/
 *-cookies.json
 storage-state.json
 cookies.json
+*_cookies.txt
 
 # Generated screenshots and local artifacts
 *.png

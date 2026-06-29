@@ -40,7 +40,6 @@ API_URL_HINTS = (
     "logistics",
     "tracking",
     "shipment",
-    "api/v4",
 )
 ORDER_KEY_HINTS = (
     "order",
@@ -54,11 +53,6 @@ ORDER_KEY_HINTS = (
     "shipping",
     "logistics",
     "tracking",
-    "item",
-    "product",
-    "shop",
-    "seller",
-    "status",
 )
 COMPLETED_STATUS_HINTS = {
     "completed",
@@ -71,6 +65,16 @@ COMPLETED_STATUS_HINTS = {
     "batal",
     "refund",
     "returned",
+}
+SHOPEE_STATUS_LABELS = {
+    "label_waiting_pickup": "Menunggu pickup kurir",
+    "label_to_ship": "Dikemas",
+    "label_on_the_way": "Dalam pengiriman",
+    "label_to_receive": "Dalam pengiriman",
+    "label_order_completed": "Selesai",
+    "label_rated": "Selesai - sudah dinilai",
+    "label_cancelled": "Dibatalkan",
+    "label_canceled": "Dibatalkan",
 }
 
 
@@ -197,6 +201,27 @@ def url_looks_relevant(url: str) -> bool:
     return "shopee.co.id" in lowered and any(hint in lowered for hint in API_URL_HINTS)
 
 
+def text_looks_logged_out(text: str) -> bool:
+    lowered = text.lower()
+    logged_out_markers = [
+        "daftar | log in",
+        "daftar log in",
+        "login",
+        "log in",
+    ]
+    logged_in_markers = [
+        "pesanan saya",
+        "belum ada pesanan",
+        "pengiriman",
+        "selesai",
+        "batalkan",
+        "beri penilaian",
+    ]
+    return any(marker in lowered for marker in logged_out_markers) and not any(
+        marker in lowered for marker in logged_in_markers
+    )
+
+
 def payload_looks_relevant(value: object, depth: int = 0) -> bool:
     if depth > 8:
         return False
@@ -221,9 +246,13 @@ async def goto_first_available(page: Page) -> str:
         try:
             await page.goto(url, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
-            if "/login" not in page.url.lower():
+            try:
+                page_text = normalize_text(await page.locator("body").inner_text(timeout=5000))
+            except Error:
+                page_text = ""
+            if "/login" not in page.url.lower() and not text_looks_logged_out(page_text):
                 return page.url
-            errors.append(f"{url}: redirected to login")
+            errors.append(f"{url}: Shopee session is logged out")
         except Error as exc:
             errors.append(f"{url}: {str(exc).splitlines()[0]}")
     raise RuntimeError("Could not open Shopee orders. " + "; ".join(errors))
@@ -262,6 +291,8 @@ async def wait_for_api_capture(page: Page, captured: list[dict]) -> str:
             continue
 
         lowered = page_text.lower()
+        if text_looks_logged_out(page_text):
+            return "logged_out"
         if any(text in lowered for text in ["belum ada pesanan", "no orders", "tidak ada pesanan"]):
             return "empty"
         if any(text in lowered for text in ["coba lagi", "try again", "terjadi kesalahan"]):
@@ -285,7 +316,9 @@ def find_order_objects(value: object, depth: int = 0) -> list[dict]:
         has_order_shape = any("order" in key for key in keys) and any(
             key in keys for key in ["items", "itemlist", "item_list", "products", "productlist", "product_list"]
         )
-        if has_order_id or has_order_shape:
+        info_card = value.get("info_card")
+        has_shopee_order_detail = isinstance(info_card, dict) and first_value(info_card, ["order_id", "orderid"])
+        if has_order_id or has_order_shape or has_shopee_order_detail:
             matches.append(value)
         for nested in value.values():
             matches.extend(find_order_objects(nested, depth + 1))
@@ -370,6 +403,9 @@ def stringify_status(value: object) -> str | None:
     if isinstance(value, (int, float)):
         return str(int(value))
     if isinstance(value, dict):
+        translated = translate_shopee_status(value)
+        if translated:
+            return translated
         for key in ["text", "label", "display", "description", "status", "title", "name"]:
             nested = value.get(key)
             if nested not in (None, ""):
@@ -377,8 +413,29 @@ def stringify_status(value: object) -> str | None:
     return normalize_text(value)
 
 
+def translate_shopee_status(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ["list_view_status_label", "status_label"]:
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            text = nested.get("text")
+            if text in SHOPEE_STATUS_LABELS:
+                return SHOPEE_STATUS_LABELS[text]
+    text = value.get("text")
+    if isinstance(text, str) and text in SHOPEE_STATUS_LABELS:
+        return SHOPEE_STATUS_LABELS[text]
+    return None
+
+
+def shopee_info_card(order: dict) -> dict:
+    info_card = order.get("info_card")
+    return info_card if isinstance(info_card, dict) else order
+
+
 def collect_product_dicts(order: dict) -> list[dict]:
     candidates = []
+    source = shopee_info_card(order)
     for key in [
         "item_list",
         "itemlist",
@@ -389,15 +446,26 @@ def collect_product_dicts(order: dict) -> list[dict]:
         "parcel_items",
         "order_items",
     ]:
-        value = order.get(key)
+        value = source.get(key)
         if isinstance(value, list):
             candidates.extend(item for item in value if isinstance(item, dict))
-    info_card = order.get("info_card")
-    if isinstance(info_card, dict):
-        for key in ["order_list_cards", "product_info", "items"]:
-            value = info_card.get(key)
-            if isinstance(value, list):
-                candidates.extend(item for item in value if isinstance(item, dict))
+    order_cards = source.get("order_list_cards")
+    if isinstance(order_cards, list):
+        for card in order_cards:
+            if not isinstance(card, dict):
+                continue
+            product_info = card.get("product_info")
+            if not isinstance(product_info, dict):
+                continue
+            item_groups = product_info.get("item_groups")
+            if isinstance(item_groups, list):
+                for group in item_groups:
+                    if isinstance(group, dict) and isinstance(group.get("items"), list):
+                        candidates.extend(item for item in group["items"] if isinstance(item, dict))
+            for key in ["items", "item_list", "products"]:
+                value = product_info.get(key)
+                if isinstance(value, list):
+                    candidates.extend(item for item in value if isinstance(item, dict))
     return candidates
 
 
@@ -441,6 +509,7 @@ def format_product(product: dict) -> dict:
 
 
 def summarize_tracking(order: dict) -> dict:
+    source = shopee_info_card(order)
     tracking = first_value(
         order,
         ["tracking_info", "tracking", "logistics", "shipping", "shipment", "package_tracking_info"],
@@ -452,7 +521,7 @@ def summarize_tracking(order: dict) -> dict:
         {"latest_status", "current_status", "tracking_status", "description", "status_desc", "text"},
     )
     awb = deep_first_value(order, {"tracking_number", "tracking_no", "shipping_traceno", "awb", "resi"})
-    courier = deep_first_value(order, {"shipping_carrier", "logistics_channel", "courier", "carrier", "channel_name"})
+    courier = deep_first_value(source, {"shipping_carrier", "logistics_channel", "courier", "carrier", "channel_name"})
     eta = deep_first_value(order, {"eta", "estimated_delivery_time", "estimated_delivery_date", "delivery_time"})
     return {
         "available": bool(tracking or latest or awb or courier or eta),
@@ -464,8 +533,9 @@ def summarize_tracking(order: dict) -> dict:
 
 
 def order_identity(order: dict) -> str:
+    source = shopee_info_card(order)
     identity = first_value(
-        order,
+        source,
         ["order_sn", "ordersn", "order_id", "orderid", "checkout_id", "checkoutid"],
     )
     if identity not in (None, ""):
@@ -476,7 +546,7 @@ def order_identity(order: dict) -> str:
 def order_status(order: dict) -> str:
     value = first_value(
         order,
-        ["status_text", "status", "order_status", "order_status_text", "shipping_status", "status_label"],
+        ["status", "status_text", "order_status", "order_status_text", "shipping_status", "status_label"],
     )
     if value in (None, ""):
         value = deep_first_value(order, {"status_text", "order_status_text", "status_label", "title", "text"})
@@ -484,8 +554,9 @@ def order_status(order: dict) -> str:
 
 
 def order_date(order: dict) -> str | None:
+    source = shopee_info_card(order)
     value = first_value(
-        order,
+        source,
         ["create_time", "ctime", "order_time", "pay_time", "payment_time", "date", "created_at"],
     )
     if isinstance(value, (int, float)):
@@ -520,8 +591,8 @@ def extract_simple_order(order: dict) -> dict:
             products = [{"nama_produk": normalize_text(name), "harga": None, "quantity": None, "product_id": None}]
 
     total = first_value(
-        order,
-        ["total_amount", "total_price", "amount", "final_total", "order_total", "payment_amount"],
+        shopee_info_card(order),
+        ["final_total", "total_amount", "total_price", "amount", "order_total", "payment_amount", "subtotal"],
     )
     shop_name = deep_first_value(order, {"shop_name", "seller_name", "username"})
     status = order_status(order)
@@ -609,6 +680,16 @@ def build_orders_message(simple_orders: list[dict]) -> str:
     return "\n\n".join(lines).rstrip()
 
 
+def build_status_report(status: str) -> str | None:
+    if status == "logged_out":
+        return (
+            "Sesi Shopee belum login.\n"
+            "Import ulang cookies dari browser yang sudah login: "
+            "login_shopee.py --cookies-txt cookies.txt\n"
+        )
+    return None
+
+
 def load_simple_orders(path: Path) -> list[dict] | None:
     if not path.exists():
         return None
@@ -653,11 +734,14 @@ async def capture_response(
     network_log: list[dict],
     order_requests: list[dict],
 ) -> None:
-    request = response.request
-    if request.resource_type not in {"fetch", "xhr"}:
+    try:
+        request = response.request
+        if request.resource_type not in {"fetch", "xhr"}:
+            return
+        append_order_request(request, order_requests)
+        content_type = (await response.header_value("content-type") or "").lower()
+    except Error:
         return
-    append_order_request(request, order_requests)
-    content_type = (await response.header_value("content-type") or "").lower()
     network_log.append(
         {
             "type": "response",
@@ -841,7 +925,10 @@ async def check_orders(
 ) -> tuple[str, str, list[dict], list[dict], str, str, Path, Path, Path, Path, Path, Path, Path, int]:
     state_path = Path(args.state).expanduser().resolve()
     if not state_path.exists():
-        raise RuntimeError(f"Storage state not found at {state_path}. Login first with login_shopee.py.")
+        raise RuntimeError(
+            f"Storage state not found at {state_path}. "
+            "Import browser cookies first with: login_shopee.py --cookies-txt cookies.txt"
+        )
 
     output_path = Path(args.output).expanduser().resolve()
     api_dump_path = Path(args.api_dump).expanduser().resolve()
@@ -902,8 +989,9 @@ async def check_orders(
 
             orders = summarize_api_payloads(captured)
             simple_orders = filter_simple_orders(build_simple_orders(captured, include_completed=True), args)
-            report = build_orders_report(simple_orders)
-            message = build_orders_message(simple_orders)
+            status_report = build_status_report(status)
+            report = status_report or build_orders_report(simple_orders)
+            message = (status_report.rstrip() if status_report else build_orders_message(simple_orders))
             output = {
                 "url": final_url,
                 "status": status,

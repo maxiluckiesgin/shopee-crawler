@@ -12,21 +12,43 @@ python -m pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-## Login
+## Session
+
+### Browser cookies export
+
+Shopee often rejects automated login browsers. The preferred flow is:
+
+1. Log in to Shopee in your normal Chrome or Firefox browser.
+2. Use a cookies export extension such as `Get cookies.txt LOCALLY`.
+3. Export cookies for `shopee.co.id` as Netscape `cookies.txt`.
+4. Import that file:
+
+```bash
+python login_shopee.py --cookies-txt cookies.txt
+```
+
+The import does not open Shopee login in Playwright. It converts the exported
+browser cookies and saves:
+
+- `output/shopee-state.json` for Playwright `storage_state`
+- `output/shopee-cookies.json` for raw browser cookies
+
+You can also set the path with an environment variable:
+
+```bash
+SHOPEE_COOKIES_TXT="/path/to/cookies.txt" python login_shopee.py
+```
 
 ### Email, phone, or username login
+
+Credential login is still available, but Shopee may detect the automation
+browser and block it:
 
 ```bash
 export SHOPEE_IDENTIFIER="email@example.com"
 export SHOPEE_PASSWORD="your-password"
 python login_shopee.py
 ```
-
-The script logs in with your Shopee credentials and saves:
-
-
-- `output/shopee-state.json` for Playwright `storage_state`
-- `output/shopee-cookies.json` for raw browser cookies
 
 If Shopee asks for OTP, set `SHOPEE_OTP` before running or enter the code when
 prompted:
@@ -44,6 +66,7 @@ python login_shopee.py --headful
 Useful variants:
 
 ```bash
+python login_shopee.py --cookies-txt /tmp/shopee-cookies.txt
 python login_shopee.py --login-timeout 300000
 python login_shopee.py --cookies /tmp/shopee-cookies.json
 python login_shopee.py --print-login-url
